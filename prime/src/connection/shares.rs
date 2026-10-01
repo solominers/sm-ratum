@@ -587,7 +587,10 @@ impl Connection<'_> {
             );
             return ShareVerdict::Rejected(RejectReason::HashLimit);
         }
-        if let Some(refusal) = lock(&self.server.limiter).check(&identity, &self.client_sign_pk, now) {
+        let ntime = u64::from(s.block_time());
+        let refusal =
+            lock(&self.server.limiter).check(&identity, &self.client_sign_pk, ntime, rebuilt.difficulty, now);
+        if let Some(refusal) = refusal {
             self.report_refusal(&identity, &refusal, now);
             return ShareVerdict::Rejected(RejectReason::HashLimit);
         }
@@ -605,7 +608,6 @@ impl Connection<'_> {
             rebuilt.difficulty,
             now,
         );
-        let ntime = u64::from(s.block_time());
         lock(&self.server.limiter).observe(
             &identity,
             &self.client_sign_pk,
@@ -617,9 +619,21 @@ impl Connection<'_> {
     }
 
     /// Logs a hashrate-limit refusal at `warn` once per identity per `REFUSAL_LOG_INTERVAL`
-    /// on this connection, at `debug` otherwise.
+    /// on this connection, at `debug` otherwise; a ban every time, since it happens once.
     fn report_refusal(&mut self, identity: &str, refusal: &crate::limiter::Refusal, now: u64) {
         let peer = self.peer;
+        if let Some(ban) = &refusal.ban {
+            warn!(
+                "[{peer}]   ** {identity} is banned for {} ({}s), its {} ban: {}. Its shares are \
+                 refused until then",
+                crate::limiter::period_text(ban.until.saturating_sub(now)),
+                ban.until.saturating_sub(now),
+                ordinal(ban.times),
+                ban.reason
+            );
+            self.refusals_reported.insert(identity.to_string(), now);
+            return;
+        }
         let last = self.refusals_reported.get(identity).copied();
         if last.is_some_and(|t| now < t.saturating_add(REFUSAL_LOG_INTERVAL_SECS)) {
             debug!("[{peer}]   <- rejected: {identity} over its hashrate limit ({})", refusal.reason);
@@ -968,6 +982,17 @@ fn describe_share(s: &PowSubmit) -> String {
         if s.quickdiff { " quickdiff" } else { "" },
         sections
     )
+}
+
+/// `n` as "1st", "2nd", "3rd", "4th"...
+fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, r) if r != 11 => "st",
+        (2, r) if r != 12 => "nd",
+        (3, r) if r != 13 => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 #[cfg(test)]

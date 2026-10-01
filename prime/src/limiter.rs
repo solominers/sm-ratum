@@ -3,15 +3,24 @@
 //! threshold catches a large miner within a minute, and a long period with a low threshold
 //! holds the cap the pool is built around, while the variance of a small miner's share
 //! arrivals over a short period never reaches the short period's threshold. An identity over
-//! any bracket has its shares refused (`RejectReason::HashLimit`) while it stays over: nothing
-//! is banned, so nobody can be locked out for a day by a burst of shares, their own or
-//! anyone else's. Which shares are refused depends on the gateway they come through: the
-//! identity's home gateway, the one that has mined it the most over the last `HOME_DAYS`,
-//! keeps its shares accepted unless its own shares alone are over, and every other gateway's
-//! are refused. A gateway pointing hashrate at someone else's address to get it refused
-//! only gets itself refused. The operators can still ban an identity by hand (`--ban`), for
-//! `--ban-secs`, longer each time when escalation is set; bans are written to the ledger
-//! file, so a restart keeps them.
+//! any bracket has its shares refused (`RejectReason::HashLimit`) while it stays over. Which
+//! shares are refused depends on the gateway they come through: the identity's home gateway,
+//! the one that has mined it the most over the last `HOME_DAYS`, keeps its shares accepted
+//! unless its own shares alone are over, and every other gateway's are refused. A gateway
+//! pointing hashrate at someone else's address to get it refused only gets itself refused.
+//!
+//! An identity whose home gateway's own shares read over a bracket is known to be over the
+//! cap, and is banned for `--ban-secs`, longer each time when escalation is set. The longest
+//! bracket is the cap itself, and `--hash-limit-sigma` widens it by the wobble of a reading
+//! over few shares, so a rig just under the cap is never banned by the variance of its own
+//! share arrivals; the shorter brackets stand well above the cap, where no honest rig reads,
+//! and get no margin. The reading that bans counts the gateway's refused shares too, so a
+//! rig that stays over is banned even while its shares are being refused, and it must rest
+//! on at least `MIN_BAN_SHARES` shares, so a single share of a very high difficulty, which
+//! reads as a huge rate over a short period, bans nobody: that is refused and nothing more.
+//! Only the home gateway's own shares can ban: a stranger's burst at an address is refused.
+//! The operators also ban by hand (`--ban`); bans are written to the ledger file, so a
+//! restart keeps them.
 //!
 //! A share is placed at its header time, no earlier than `REPLAY_ALLOWANCE` before its
 //! acceptance: a gateway that reconnects replays the shares it queued while it was away, and
@@ -55,10 +64,13 @@ const HOME_WRITE_EVERY: u32 = 64;
 /// The gateways that have mined each identity: `identity NUL key` to the record's first
 /// share time and its accepted work by day, so a restart keeps each identity's home.
 pub(crate) const GATEWAYS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("gateways");
-/// The most a reading may exceed a threshold by under `--hash-limit-sigma`, however few
-/// shares it rests on: an identity sending a handful of high-difficulty shares gets no wider
-/// an allowance than this.
+/// The most a reading may exceed the cap by under `--hash-limit-sigma`, however few shares
+/// it rests on: an identity sending a handful of high-difficulty shares gets no wider an
+/// allowance than this.
 pub const MAX_SIGMA_TOLERANCE: f64 = 0.25;
+/// The fewest shares a reading over a bracket must rest on to ban: fewer could be one or two
+/// shares of a very high difficulty from a small rig, which are refused, not banned.
+pub const MIN_BAN_SHARES: usize = 8;
 pub const MAX_SIGMA: f64 = 10.0;
 
 /// One measure: the hashrate over `period` an identity may not exceed.
@@ -76,10 +88,11 @@ pub struct Rules {
     pub ban_secs: u64,
     /// The factor each repeat ban is longer by: 1 for the same length every time.
     pub escalation: f64,
-    /// The statistical margin: a reading over `n` shares must exceed the threshold by
-    /// `sigma / sqrt(n)` of it (at most `MAX_SIGMA_TOLERANCE`) to ban, since a rate measured
-    /// from `n` share arrivals wobbles by about `1 / sqrt(n)` of itself. 0 bans on the
-    /// threshold itself.
+    /// The statistical margin on the cap (the longest bracket) alone: a reading over `n`
+    /// shares must exceed it by `sigma / sqrt(n)` of it (at most `MAX_SIGMA_TOLERANCE`) to
+    /// ban, since a rate measured from `n` share arrivals wobbles by about `1 / sqrt(n)` of
+    /// itself. 0 bans on the cap itself. The shorter brackets get no margin: they stand well
+    /// above the cap, where no honest rig reads.
     pub sigma: f64,
     /// Identities the brackets do not apply to, as `address::canonical` gives them.
     pub exempt: std::collections::BTreeSet<String>,
@@ -96,10 +109,14 @@ impl Rules {
         self.brackets.iter().map(|b| b.period_secs).max().unwrap_or(0)
     }
 
-    /// How long the ban after `prior` earlier bans runs.
-    /// The rate a reading over `shares` shares must exceed for `bracket` to ban.
+    /// Whether `bracket` is the cap: the longest period, the one the sigma margin applies to.
+    pub fn is_cap(&self, bracket: &Bracket) -> bool {
+        bracket.period_secs == self.longest_period()
+    }
+
+    /// The rate a reading over `shares` shares must exceed to be over `bracket`.
     pub fn allowed(&self, bracket: &Bracket, shares: usize) -> f64 {
-        let tolerance = if self.sigma > 0.0 {
+        let tolerance = if self.sigma > 0.0 && self.is_cap(bracket) {
             (self.sigma / (shares.max(1) as f64).sqrt()).min(MAX_SIGMA_TOLERANCE)
         } else {
             0.0
@@ -107,6 +124,7 @@ impl Rules {
         bracket.threshold_hs * (1.0 + tolerance)
     }
 
+    /// How long the ban after `prior` earlier bans runs.
     pub fn ban_length(&self, prior: u32) -> u64 {
         let factor = self.escalation.max(1.0).powi(prior.min(64) as i32);
         let secs = (self.ban_secs as f64 * factor).min(MAX_BAN_SECS as f64);
@@ -128,7 +146,7 @@ impl Rules {
             format!("hash-limit-exempt: {}\n", self.exempt.iter().cloned().collect::<Vec<_>>().join(", "))
         };
         format!(
-            "hash-limit: {} (over any bracket: refused while over)\nhash-limit-sigma: {}\n{exempt}ban-secs: {} ({})\nban-escalation: {}\n",
+            "hash-limit: {} (a home gateway's own shares over any bracket: banned; another gateway's: refused while over)\nhash-limit-sigma: {} (on the cap, the longest bracket)\n{exempt}ban-secs: {} ({})\nban-escalation: {}\n",
             each.join(", "),
             self.sigma,
             self.ban_secs,
@@ -316,12 +334,14 @@ impl Ban {
 /// A gateway's DATUM signing key, which its hello carries and nothing else can produce.
 pub type GatewayKey = [u8; 32];
 
-/// One accepted share: when it was placed, its difficulty, and the gateway it came through.
+/// One share: when it was placed, its difficulty, the gateway it came through, and whether
+/// it was accepted or refused by the limiter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sample {
     at: u64,
     difficulty: u64,
     gateway: GatewayKey,
+    accepted: bool,
 }
 
 /// The recent shares of one identity, oldest first.
@@ -344,29 +364,32 @@ impl Ring {
         }
     }
 
-    /// The samples since `cutoff`, those of `gateway` only when one is named.
+    /// The samples since `cutoff`, those of `gateway` only when one is named, the accepted
+    /// ones alone unless `refused` are wanted too.
     fn since<'a>(
         &'a self,
         cutoff: u64,
         gateway: Option<&'a GatewayKey>,
+        refused: bool,
     ) -> impl Iterator<Item = &'a Sample> + 'a {
-        self.samples
-            .iter()
-            .filter(move |s| s.at >= cutoff && gateway.is_none_or(|g| s.gateway == *g))
+        self.samples.iter().filter(move |s| {
+            s.at >= cutoff && (s.accepted || refused) && gateway.is_none_or(|g| s.gateway == *g)
+        })
     }
 
-    fn work_since(&self, cutoff: u64, gateway: Option<&GatewayKey>) -> u128 {
-        self.since(cutoff, gateway).map(|s| u128::from(s.difficulty)).sum()
+    fn work_since(&self, cutoff: u64, gateway: Option<&GatewayKey>, refused: bool) -> u128 {
+        self.since(cutoff, gateway, refused).map(|s| u128::from(s.difficulty)).sum()
     }
 
-    fn count_since(&self, cutoff: u64, gateway: Option<&GatewayKey>) -> usize {
-        self.since(cutoff, gateway).count()
+    fn count_since(&self, cutoff: u64, gateway: Option<&GatewayKey>, refused: bool) -> usize {
+        self.since(cutoff, gateway, refused).count()
     }
 
-    /// The gateways with a share since `cutoff`, in the order first seen there.
+    /// The gateways with a share since `cutoff`, accepted or refused, in the order first
+    /// seen there.
     fn gateways_since(&self, cutoff: u64) -> Vec<GatewayKey> {
         let mut v: Vec<GatewayKey> = Vec::new();
-        for s in self.since(cutoff, None) {
+        for s in self.since(cutoff, None, true) {
             if !v.contains(&s.gateway) {
                 v.push(s.gateway);
             }
@@ -418,13 +441,14 @@ impl GatewayRecord {
 }
 
 /// Why a share is refused by the limiter: the reading over its bracket, the identity's home
-/// gateway if it has one, and whether the refused share came through that home gateway (its
-/// own shares alone being over) or another.
+/// gateway if it has one, whether the refused share came through that home gateway (its own
+/// shares alone being over) or another, and the ban the share brought, if it did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub reason: String,
     pub home: Option<GatewayKey>,
     pub own: bool,
+    pub ban: Option<Ban>,
 }
 
 /// An identity over its cap now, as the stats report it.
@@ -451,17 +475,30 @@ impl Throttled {
     }
 }
 
+/// A reading over a bracket, described.
+struct Over {
+    reason: String,
+}
+
 /// The reading of `ring` over each bracket at `now`, the shares of `gateway` alone when one
-/// is named: the first bracket it is over, described.
-fn over(rules: &Rules, ring: &Ring, now: u64, gateway: Option<&GatewayKey>) -> Option<String> {
+/// is named and the refused ones too when `refused`: the first bracket it is over on a
+/// reading of at least `min_shares` shares.
+fn over(
+    rules: &Rules,
+    ring: &Ring,
+    now: u64,
+    gateway: Option<&GatewayKey>,
+    refused: bool,
+    min_shares: usize,
+) -> Option<Over> {
     rules.brackets.iter().find_map(|b| {
         let cutoff = now.saturating_sub(b.period_secs);
-        let work = ring.work_since(cutoff, gateway);
+        let work = ring.work_since(cutoff, gateway, refused);
         let hs = hashrate::from_work(work, Duration::from_secs(b.period_secs));
-        let shares = ring.count_since(cutoff, gateway);
+        let shares = ring.count_since(cutoff, gateway, refused);
         let allowed = rules.allowed(b, shares);
-        (hs > allowed).then(|| {
-            if allowed > b.threshold_hs {
+        (hs > allowed && shares >= min_shares).then(|| {
+            let reason = if allowed > b.threshold_hs {
                 format!(
                     "{} over {} is over the {} limit ({} allowed for a reading of {shares} shares)",
                     hashrate_text(hs),
@@ -476,7 +513,8 @@ fn over(rules: &Rules, ring: &Ring, now: u64, gateway: Option<&GatewayKey>) -> O
                     period_text(b.period_secs),
                     hashrate_text(b.threshold_hs)
                 )
-            }
+            };
+            Over { reason }
         })
     })
 }
@@ -569,11 +607,30 @@ impl Limiter {
         v
     }
 
-    /// Whether a share of `identity` through `gateway` is refused now: the identity's reading
-    /// is over a bracket, and the share is not from its home gateway, or is and the home
-    /// gateway's own shares alone are over. A refused share is not recorded, so the reading
-    /// falls as the window rolls and the refusals end on their own.
-    pub fn check(&mut self, identity: &str, gateway: &GatewayKey, now: u64) -> Option<Refusal> {
+    /// Whether a share of `identity` through `gateway`, of `difficulty` at the header time
+    /// `ntime`, is refused now: the identity's reading is over a bracket, and the share is not
+    /// from its home gateway, or is and the home gateway's own shares alone are over, which
+    /// bans the identity when the reading rests on enough shares. A refused share is recorded
+    /// as refused: it does not count towards the readings that refuse, so those fall as the
+    /// window rolls and the refusals end on their own, but it does count towards the home
+    /// gateway's reading that bans, so a rig that stays over is banned while being refused.
+    pub fn check(
+        &mut self,
+        identity: &str,
+        gateway: &GatewayKey,
+        ntime: u64,
+        difficulty: u64,
+        now: u64,
+    ) -> Option<Refusal> {
+        let refusal = self.refusal(identity, gateway, now)?;
+        let at = ntime.clamp(now.saturating_sub(REPLAY_ALLOWANCE_SECS), now);
+        if let Some(ring) = self.rings.get_mut(identity) {
+            ring.push(Sample { at, difficulty, gateway: *gateway, accepted: false });
+        }
+        Some(refusal)
+    }
+
+    fn refusal(&mut self, identity: &str, gateway: &GatewayKey, now: u64) -> Option<Refusal> {
         if self.rules.brackets.is_empty() {
             return None;
         }
@@ -587,18 +644,28 @@ impl Limiter {
             return None;
         };
         ring.trim(now.saturating_sub(longest));
-        let Some(reason) = over(&self.rules, ring, now, None) else {
+        let home = self.home_of(identity, now);
+        if home.as_ref() == Some(gateway) {
+            // The home gateway's own shares, refused ones included, over a bracket on a
+            // reading of enough shares: the shortest such bracket.
+            let ring = &self.rings[identity];
+            if let Some(o) = over(&self.rules, ring, now, Some(gateway), true, MIN_BAN_SHARES) {
+                let reason = format!("{}, from its home gateway alone", o.reason);
+                let ban = self.ban(identity, now, None, reason.clone());
+                return Some(Refusal { reason, home, own: true, ban: Some(ban) });
+            }
+        }
+        let ring = &self.rings[identity];
+        let Some(o) = over(&self.rules, ring, now, None, false, 0) else {
             self.throttled_since.remove(identity);
             return None;
         };
         self.throttled_since.entry(identity.to_string()).or_insert(now);
-        let home = self.home_of(identity, now);
         if home.as_ref() == Some(gateway) {
-            let ring = &self.rings[identity];
-            let own = over(&self.rules, ring, now, Some(gateway))?;
-            return Some(Refusal { reason: format!("{own}, from this gateway alone"), home, own: true });
+            let own = over(&self.rules, ring, now, Some(gateway), false, 0)?;
+            return Some(Refusal { reason: format!("{}, from this gateway alone", own.reason), home, own: true, ban: None });
         }
-        Some(Refusal { reason, home, own: false })
+        Some(Refusal { reason: o.reason, home, own: false, ban: None })
     }
 
     /// The gateway that has mined `identity` the most over the last `HOME_DAYS`; the earliest
@@ -640,7 +707,7 @@ impl Limiter {
             });
         }
         let ring = self.rings.entry(identity.to_string()).or_default();
-        ring.push(Sample { at, difficulty, gateway: *gateway });
+        ring.push(Sample { at, difficulty, gateway: *gateway, accepted: true });
         ring.trim(now.saturating_sub(longest));
         let record = self.homes.entry(identity.to_string()).or_default().entry(*gateway).or_insert_with(
             || GatewayRecord { first_seen: now, days: VecDeque::new(), unwritten: 0 },
@@ -659,7 +726,7 @@ impl Limiter {
             .iter()
             .filter(|(identity, _)| !self.rules.exempt.contains(*identity))
             .filter_map(|(identity, ring)| {
-                let reason = over(&self.rules, ring, now, None)?;
+                let reason = over(&self.rules, ring, now, None, false, 0)?.reason;
                 let home = self.home_of(identity, now);
                 let refused = ring
                     .gateways_since(now.saturating_sub(longest))
@@ -887,11 +954,11 @@ mod tests {
     /// Observes a share and returns whether the next one from the same gateway is refused.
     fn share(l: &mut Limiter, identity: &str, gateway: &GatewayKey, ntime: u64, diff: u64, now: u64) -> Option<Refusal> {
         l.observe(identity, gateway, ntime, diff, now);
-        l.check(identity, gateway, now)
+        l.check(identity, gateway, ntime, diff, now)
     }
 
     #[test]
-    fn a_miner_under_the_cap_is_never_refused_and_one_over_it_is_refused_while_it_stays_over() {
+    fn a_miner_under_the_cap_is_never_refused_and_one_over_it_is_banned_once_its_reading_fills() {
         let mut l = Limiter::new(starter());
         // 3 TH/s, a share every 20 seconds for three hours: under every bracket.
         let diff = work_for(3.0 * T, 20.0);
@@ -900,7 +967,8 @@ mod tests {
             assert_eq!(share(&mut l, "small", &G, now, diff, now), None, "share {i}");
         }
         assert!(l.throttled(1_000_000 + 3 * 3600).is_empty());
-        // 4 TH/s: under the short brackets, over the 2 hour one once two hours are in.
+        // 4 TH/s: under the short brackets, over the 2 hour one once two hours are in, and
+        // banned then: its one gateway is its home, and its own shares are what is over.
         let mut l = Limiter::new(starter());
         let diff = work_for(4.0 * T, 20.0);
         let mut refused_at = None;
@@ -919,9 +987,13 @@ mod tests {
         let t = l.throttled(now);
         assert_eq!((t.len(), t[0].identity.as_str(), t[0].since, t[0].home), (1, "four", now, Some(G)));
         assert!(t[0].refused.is_empty(), "nothing but the home gateway has mined it");
-        // Nothing is banned; once the window rolls past the shares, the refusals end.
-        assert!(l.ban_of("four", now).is_none() && l.active_bans(now).is_empty());
-        assert_eq!(l.check("four", &G, now + 7201), None, "the reading emptied");
+        let ban = r.ban.expect("the home gateway's own reading over the cap bans");
+        assert_eq!((ban.times, ban.until), (1, now + ratum::SECS_PER_DAY));
+        assert!(ban.reason.contains("over 2h is over the 3.50 TH/s limit, from its home gateway alone"), "{}", ban.reason);
+        assert_eq!(l.ban_of("four", now), Some(&ban));
+        assert_eq!(l.active_bans(now + ratum::SECS_PER_DAY), Vec::new(), "the ban runs its length");
+        // Once the window rolls past the shares, the readings are empty again.
+        assert_eq!(l.check("four", &G, now + 7201, diff, now + 7201), None, "the reading emptied");
         assert!(l.throttled(now + 7201).is_empty());
     }
 
@@ -943,7 +1015,7 @@ mod tests {
         assert!(l.throttled(1_000_000 + 3 * 3600).is_empty());
         // The samples were kept: lifting the exemption refuses at once.
         l.set_rules(rules(&["1m=100T", "2h=3.5T"]));
-        assert!(l.check("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &G, 1_000_000 + 3 * 3600).is_some());
+        assert!(l.check("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &G, 1_000_000 + 3 * 3600, diff, 1_000_000 + 3 * 3600).is_some());
     }
 
     #[test]
@@ -965,7 +1037,7 @@ mod tests {
         let mut refused = None;
         for i in 0..12 {
             let at = now + i * 5;
-            match l.check("victim", &attacker, at) {
+            match l.check("victim", &attacker, at, big, at) {
                 Some(r) => {
                     refused = Some(r);
                     break;
@@ -976,6 +1048,7 @@ mod tests {
         // The 2 hour reading, nearly full from the miner's own shares, tips first.
         let r = refused.expect("the burst puts the address over a bracket");
         assert!(!r.own && r.home == Some(G), "not the home gateway: {r:?}");
+        assert!(r.ban.is_none() && l.active_bans(now + 60).is_empty(), "a stranger's shares ban nobody");
         assert!(r.reason.contains("over 2h is over the 3.50 TH/s limit"), "{}", r.reason);
         // The miner's own shares are still accepted: its own reading is under every bracket.
         assert_eq!(share(&mut l, "victim", &G, now + 60, diff, now + 60), None);
@@ -985,7 +1058,7 @@ mod tests {
         assert_eq!(l.home_of("victim", now + 60), Some(G));
         // Two hours on, the burst has rolled out of every window and the attacker's shares
         // would be accepted again, until they are over again.
-        assert_eq!(l.check("victim", &attacker, now + 7300), None);
+        assert_eq!(l.check("victim", &attacker, now + 7300, big, now + 7300), None);
         assert!(l.throttled(now + 7300).is_empty());
     }
 
@@ -1004,10 +1077,10 @@ mod tests {
         let mut first_refusal = None;
         for i in 0..(3 * 3600 / 20) {
             let now = from + i * 20;
-            assert_eq!(l.check("m", &G, now), None, "the home gateway alone is under: share {i}");
+            assert_eq!(l.check("m", &G, now, diff, now), None, "the home gateway alone is under: share {i}");
             l.observe("m", &G, now, diff, now);
             if first_refusal.is_none() {
-                match l.check("m", &second, now) {
+                match l.check("m", &second, now, diff, now) {
                     Some(r) => first_refusal = Some((i * 20, r)),
                     None => l.observe("m", &second, now, diff, now),
                 }
@@ -1015,33 +1088,66 @@ mod tests {
         }
         let (secs, r) = first_refusal.expect("6 TH/s is over the 2h cap");
         assert!(secs <= 7200, "{secs}");
-        assert!(!r.own && r.home == Some(G), "{r:?}");
-        // Alone over: the home gateway is refused too.
+        assert!(!r.own && r.home == Some(G) && r.ban.is_none(), "{r:?}");
+        assert!(l.active_bans(from + 3 * 3600).is_empty(), "the second gateway's shares ban nobody");
+        // Alone over: the home gateway is banned.
         let mut l = Limiter::new(starter());
         let diff = work_for(10.0 * T, 20.0);
         let refused = (0..(3 * 3600 / 20)).find_map(|i| {
             let now = start + i * 20;
             share(&mut l, "big", &G, now, diff, now)
         });
-        assert!(refused.is_some_and(|r| r.own), "10 TH/s on one gateway");
+        assert!(refused.is_some_and(|r| r.own && r.ban.is_some()), "10 TH/s on one gateway");
     }
 
     #[test]
     fn a_large_miner_is_caught_by_the_short_bracket_in_a_minute() {
         let mut l = Limiter::new(starter());
-        // 200 TH/s at a difficulty solved every 5 seconds.
+        // 200 TH/s at a difficulty solved every 5 seconds: over the 1 minute bracket from the
+        // seventh share, 30 seconds in, when the reading rests on too few shares to ban, so
+        // the share is refused; the refused shares count, and the eighth or so bans.
         let diff = work_for(200.0 * T, 5.0);
         let mut refused_at = None;
+        let mut banned_at = None;
         for i in 0..1000 {
             let now = 1_000_000 + i * 5;
-            if let Some(r) = share(&mut l, "big", &G, now, diff, now) {
-                refused_at = Some((i * 5, r));
+            let r = if l.ban_of("big", now).is_some() { break } else { share(&mut l, "big", &G, now, diff, now) };
+            if let Some(r) = r {
+                if r.ban.is_some() {
+                    banned_at = Some((i * 5, r));
+                } else if refused_at.is_none() {
+                    refused_at = Some((i * 5, r));
+                }
+            }
+        }
+        let (secs, r) = refused_at.expect("refused before banned");
+        assert!(secs <= 60, "refused after {secs}s");
+        assert!(r.reason.contains("over 1m is over the 100 TH/s limit"), "{}", r.reason);
+        let (banned, b) = banned_at.expect("banned");
+        assert!(banned > secs && banned <= 60, "banned after {banned}s");
+        assert!(l.rings["big"].count_since(0, Some(&G), true) >= MIN_BAN_SHARES);
+        let ban = b.ban.unwrap();
+        assert!(ban.reason.contains("over 1m is over the 100 TH/s limit, from its home gateway alone"), "{}", ban.reason);
+        assert_eq!(l.ban_of("big", 1_000_000 + banned), Some(&ban));
+        // A share of a huge difficulty once a minute reads as 500 TH/s over the 1 minute
+        // bracket from the first, on one share: refused, not banned. The 5 minute bracket,
+        // over too, bans once it rests on enough of them.
+        let mut l = Limiter::new(starter());
+        let one = work_for(500.0 * T, 60.0);
+        let mut banned_at = None;
+        for i in 0..30 {
+            let now = 1_000_000 + i * 60;
+            let r = share(&mut l, "lumpy", &G, now, one, now).expect("over from the first share");
+            if let Some(ban) = r.ban {
+                banned_at = Some((i, ban));
                 break;
             }
         }
-        let (secs, r) = refused_at.unwrap();
-        assert!(secs <= 60, "refused after {secs}s");
-        assert!(r.reason.contains("over 1m is over the 100 TH/s limit"), "{}", r.reason);
+        // Each round observes one share and has the next refused, so eight samples are in
+        // after four rounds.
+        let (i, ban) = banned_at.expect("banned once enough shares are in");
+        assert!(i >= 1 && l.rings["lumpy"].count_since(0, Some(&G), true) >= MIN_BAN_SHARES, "round {i}");
+        assert!(ban.reason.contains("over 5m is over the 50 TH/s limit"), "{}", ban.reason);
     }
 
     #[test]
@@ -1078,6 +1184,8 @@ mod tests {
         assert!((4.05 * T..4.06 * T).contains(&allowed), "{allowed}");
         assert!((rules.allowed(bracket, 1) - 3.5 * T * 1.25).abs() < 1.0, "few shares: the cap on the margin");
         assert_eq!(starter().allowed(bracket, 360), 3.5 * T, "sigma 0: the threshold itself");
+        assert_eq!(rules.allowed(&rules.brackets[0], 1), 100.0 * T, "no margin on a short bracket");
+        assert_eq!(rules.allowed(&rules.brackets[2], 4), 10.0 * T, "no margin on a short bracket");
 
         // 4 TH/s, 14% over the cap, is under the margin: never refused.
         let mut l = Limiter::new(rules.clone());
@@ -1180,7 +1288,7 @@ mod tests {
     fn without_brackets_nothing_is_observed() {
         let mut l = Limiter::new(Rules::default());
         l.observe("x", &G, 1, u64::MAX, 1);
-        assert_eq!(l.check("x", &G, 1), None);
+        assert_eq!(l.check("x", &G, 1, u64::MAX, 1), None);
         assert!(l.rings.is_empty() && l.homes.is_empty());
     }
 }
